@@ -1,133 +1,145 @@
 import os
 import re
-import streamlit as st
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
 import nltk
+import streamlit as st
 import pandas as pd
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from fpdf import FPDF
 
-# ---------------------------------
-# SETUP
-# ---------------------------------
-nltk.download('punkt')
-nltk.download('stopwords')
+# --- NLTK auto-setup (for Streamlit Cloud) ---
+nltk_packages = ["punkt", "stopwords"]
+for pkg in nltk_packages:
+    try:
+        nltk.data.find(f"tokenizers/{pkg}")
+    except LookupError:
+        nltk.download(pkg, quiet=True)
 
-st.set_page_config(page_title="Mini-Eightfold AI", page_icon="🧠", layout="wide")
+# --- Constants ---
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+STOPWORDS = set(stopwords.words("english"))
+PASSWORD = "admin123"  # change this for your app
 
-PASSWORD = "aihero"  # 🔒 change this to your own secret password
 
-# ---------------------------------
-# AUTHENTICATION
-# ---------------------------------
-def login():
-    st.title("🔐 Login to Mini-Eightfold AI")
-    st.markdown("Enter your access password below to continue.")
-    password_input = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if password_input == PASSWORD:
-            st.session_state["authenticated"] = True
-            st.success("✅ Access granted! Loading app...")
-        else:
-            st.error("❌ Incorrect password. Try again.")
-
-# ---------------------------------
-# CLEANING FUNCTIONS
-# ---------------------------------
+# --- Helper Functions ---
 def clean_text(text):
-    tokens = word_tokenize(text.lower())
-    stop_words = set(stopwords.words("english"))
-    filtered = [word for word in tokens if word.isalnum() and word not in stop_words]
-    return " ".join(filtered)
+    """Lowercase, remove non-letters, and filter out stopwords."""
+    text = text.lower()
+    text = re.sub(r"[^a-zA-Z\s]", "", text)
+    tokens = word_tokenize(text)
+    tokens = [t for t in tokens if t not in STOPWORDS]
+    return " ".join(tokens)
 
-def load_text_files(folder):
-    texts = {}
-    for filename in os.listdir(folder):
-        path = os.path.join(folder, filename)
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                texts[filename] = f.read()
-    return texts
 
-# ---------------------------------
-# MATCHING & SCORING
-# ---------------------------------
+def load_resumes(folder="data/resumes"):
+    resumes = {}
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+        return resumes
+
+    for file in os.listdir(folder):
+        if file.endswith(".txt"):
+            with open(os.path.join(folder, file), "r", encoding="utf-8") as f:
+                resumes[file] = f.read()
+    return resumes
+
+
+def load_job_description(file_path="data/job_descriptions/quality_engineer.txt"):
+    if not os.path.exists(file_path):
+        st.warning("No job description found.")
+        return ""
+    with open(file_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
 def match_resumes(resumes, job_desc):
+    """Compute similarity scores between resumes and job description."""
+    if not resumes or not job_desc:
+        return []
+
+    model = SentenceTransformer(MODEL_NAME)
+
     cleaned_resumes = [clean_text(t) for t in resumes.values()]
     cleaned_jd = clean_text(job_desc)
 
-    tfidf = TfidfVectorizer()
-    all_texts = cleaned_resumes + [cleaned_jd]
-    tfidf_matrix = tfidf.fit_transform(all_texts)
+    embeddings = model.encode([cleaned_jd] + cleaned_resumes)
+    jd_vector = embeddings[0].reshape(1, -1)
+    resume_vectors = embeddings[1:]
 
-    jd_vector = tfidf_matrix[-1]
-    resume_vectors = tfidf_matrix[:-1]
+    similarities = cosine_similarity(jd_vector, resume_vectors)[0]
+    results = sorted(zip(resumes.keys(), similarities), key=lambda x: x[1], reverse=True)
+    return results
 
-    similarities = cosine_similarity(resume_vectors, jd_vector)
-    scores = similarities.flatten()
 
-    return dict(zip(resumes.keys(), scores))
+def generate_pdf(results):
+    """Generate a PDF summary of ranked resumes."""
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
 
-# ---------------------------------
-# CHATBOT (simple rule-based)
-# ---------------------------------
-def chat_response(query, ranked_results):
-    if "best" in query:
-        top_candidate = max(ranked_results, key=ranked_results.get)
-        return f"The best candidate is **{top_candidate}** with a score of {ranked_results[top_candidate]:.2f}."
-    elif "worst" in query:
-        low_candidate = min(ranked_results, key=ranked_results.get)
-        return f"The lowest scoring candidate is **{low_candidate}** with a score of {ranked_results[low_candidate]:.2f}."
-    elif "average" in query:
-        avg_score = sum(ranked_results.values()) / len(ranked_results)
-        return f"The average candidate score is **{avg_score:.2f}**."
-    else:
-        return "You can ask me things like 'Who is the best candidate?' or 'What is the average score?'"
+    pdf.cell(200, 10, txt="📋 Resume Matching Results", ln=True, align="C")
+    pdf.ln(10)
 
-# ---------------------------------
-# MAIN APP FUNCTION
-# ---------------------------------
+    for name, score in results:
+        pdf.cell(200, 10, txt=f"{name}: {score:.3f}", ln=True, align="L")
+
+    pdf_file = "results_summary.pdf"
+    pdf.output(pdf_file)
+    return pdf_file
+
+
+# --- Streamlit UI ---
+def login_screen():
+    st.title("🔐 Mini-Eightfold AI — Secure Login")
+    st.write("Please enter the password to access the system.")
+
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if password == PASSWORD:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password. Please try again.")
+
+
 def app():
-    st.title("🧠 Mini-Eightfold AI — Resume Matcher")
-    st.markdown("Match resumes to job descriptions with AI and chat with insights.")
+    st.title("🚀 Mini-Eightfold AI — Resume Matcher")
 
-    job_folder = "data/job_descriptions"
-    resume_folder = "data/resumes"
+    job_desc = load_job_description()
+    resumes = load_resumes()
 
-    if not os.path.exists(job_folder) or not os.path.exists(resume_folder):
-        st.error("❌ Missing data folders.")
+    if not resumes:
+        st.warning("⚠️ No resumes found in the folder!")
         return
 
-    job_files = list(os.listdir(job_folder))
-    selected_jd = st.selectbox("Select a Job Description", job_files)
-    jd_path = os.path.join(job_folder, selected_jd)
-    with open(jd_path, "r", encoding="utf-8", errors="ignore") as f:
-        job_desc = f.read()
+    st.success(f"✅ Loaded {len(resumes)} resumes and job description.")
+    st.write("⏳ Computing similarity scores...")
 
-    resumes = load_text_files(resume_folder)
-    st.info(f"Loaded {len(resumes)} resumes for matching.")
+    results = match_resumes(resumes, job_desc)
 
-    if st.button("Run Matching"):
-        results = match_resumes(resumes, job_desc)
-        ranked = sorted(results.items(), key=lambda x: x[1], reverse=True)
-        st.success("✅ Matching complete!")
+    st.subheader("📊 Results:")
+    for name, score in results:
+        st.markdown(f"**{name} — Score: {score:.3f}**")
 
-        df = pd.DataFrame(ranked, columns=["Candidate", "Score"])
-        st.dataframe(df)
+    # PDF export
+    if st.button("📄 Generate PDF Summary"):
+        pdf_path = generate_pdf(results)
+        with open(pdf_path, "rb") as f:
+            st.download_button(
+                label="Download Results PDF",
+                data=f,
+                file_name="resume_match_results.pdf",
+                mime="application/pdf",
+            )
 
-        st.markdown("### 💬 Chat with the AI Assistant")
-        query = st.text_input("Ask a question (e.g., Who is the best candidate?)")
-        if query:
-            st.markdown(chat_response(query.lower(), results))
 
-# ---------------------------------
-# ENTRY POINT
-# ---------------------------------
+# --- App Entry Point ---
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
 if not st.session_state["authenticated"]:
-    login()
+    login_screen()
 else:
     app()
